@@ -34,6 +34,12 @@ Thumbs.db
 # Testing
 coverage/
 
+# Local AI artifacts
+.claude/
+.prompts/
+.project-state.json
+nul
+
 # Misc
 *.log
 *.tsbuildinfo
