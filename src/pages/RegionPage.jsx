@@ -1,6 +1,10 @@
 import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { getGamesByRegion, LOTTERY_GAMES, nCr, generateNumbers, generateQuickPick, checkTicket, formatCurrency, formatNumber } from '../utils/lotteryData';
+import { getGamesByRegion, LOTTERY_GAMES, formatCurrency, formatNumber } from '../utils/lotteryData';
+import { prizeValue, generateQuickPick } from '../utils/engine';
+import { runSingleDraw, simulateUntilDivision1 } from '../utils/simulation';
+import { loadStats, saveStats, recordDraw } from '../utils/stats';
+import { systemEntriesFor, systemSizeOf, gamesPerTicketFor } from '../utils/systems';
 import GameSelector from '../components/GameSelector';
 import GameInfoBar from '../components/GameInfoBar';
 import NumberBalls from '../components/NumberBalls';
@@ -23,39 +27,22 @@ export default function RegionPage({ regionId, regionName, regionFlag }) {
 
   const game = LOTTERY_GAMES[selectedGame];
 
-  // Load stats from localStorage
+  // Load stats from the stats store
   useEffect(() => {
-    const saved = localStorage.getItem('lotto_stats_v5');
-    if (saved) setStats(JSON.parse(saved));
+    setStats(loadStats());
   }, []);
 
-  // Save stats to localStorage
+  // Save stats to the stats store
   useEffect(() => {
     if (Object.keys(stats).length > 0) {
-      localStorage.setItem('lotto_stats_v5', JSON.stringify(stats));
+      saveStats(stats);
     }
   }, [stats]);
 
-  // System entry options
-  const getSystemOptions = () => {
-    const options = [{ label: 'Standard', value: 'standard' }];
-    const maxSystem = Math.min(game.mainPool.count + 14, 20);
-    for (let i = game.mainPool.count + 1; i <= maxSystem; i++) {
-      const gamesCount = nCr(i, game.mainPool.count);
-      options.push({ label: `System ${i}`, value: `system_${i}`, games: gamesCount });
-    }
-    return options;
-  };
-
-  const getSystemSize = (sys) => {
-    if (sys === 'standard') return game.mainPool.count;
-    return parseInt(sys.split('_')[1]);
-  };
-
-  const getGamesPerTicket = (sys) => {
-    if (sys === 'standard') return 1;
-    return nCr(getSystemSize(sys), game.mainPool.count);
-  };
+  // System entry options come from the domain module
+  const systemEntries = systemEntriesFor(game);
+  const getSystemSize = (sys) => systemSizeOf(sys, game);
+  const getGamesPerTicket = (sys) => gamesPerTicketFor(sys, game);
 
   const addQuickPicks = (count) => {
     const newTickets = [];
@@ -88,55 +75,19 @@ export default function RegionPage({ regionId, regionName, regionFlag }) {
     if (tickets.length === 0) return;
     setIsDrawing(true);
 
-    const mainNumbers = generateNumbers(game.mainPool.count, game.mainPool.range);
-    let bonusNumbers = null;
-    let supplementary = null;
+    // The engine generates the draw, evaluates tickets, and produces the
+    // ledger (spent / won / divisions) in one call.
+    const { draw, ticketResults, spent, won, divisions } = runSingleDraw({ game, tickets });
 
-    if (game.bonusPool) {
-      bonusNumbers = generateNumbers(game.bonusPool.count, game.bonusPool.range);
-    }
-    if (game.supplementary) {
-      supplementary = generateNumbers(game.supplementary.count, game.supplementary.range, mainNumbers);
-    }
-
-    const draw = { mainNumbers, bonusNumbers, supplementary };
     setDrawResult(draw);
-
-    const ticketResults = tickets.map(ticket => ({
-      ticket,
-      result: checkTicket(ticket, draw, game)
-    }));
     setResults(ticketResults);
 
-    // Update stats
-    const newStats = { ...stats };
-    if (!newStats[selectedGame]) {
-      newStats[selectedGame] = { draws: 0, spent: 0, won: 0, divisions: {} };
-    }
-    newStats[selectedGame].draws++;
-
-    let totalSpentInDraw = 0;
-    ticketResults.forEach(({ ticket, result }) => {
-      totalSpentInDraw += ticket.gamesPerTicket * game.cost;
-      if (result) {
-        result.forEach(win => {
-          const prizePerWin = win.division.prizeType === 'monthly'
-            ? win.division.prize * win.division.duration
-            : win.division.prize;
-          const totalPrize = prizePerWin * win.count;
-          newStats[selectedGame].won += totalPrize;
-          newStats[selectedGame].divisions[win.division.name] =
-            (newStats[selectedGame].divisions[win.division.name] || 0) + win.count;
-        });
-      }
-    });
-    newStats[selectedGame].spent += totalSpentInDraw;
-
-    setStats(newStats);
+    // Update stats via the stats store's accumulation
+    setStats(prev => recordDraw(prev, selectedGame, { draws: 1, spent, won, divisions }));
     setIsDrawing(false);
   };
 
-  // Run simulation until Division 1 win
+  // Run simulation until Division 1 win — the loop lives in the engine now.
   const runSimulation = async () => {
     abortRef.current = false;
     setIsSimulating(true);
@@ -144,7 +95,6 @@ export default function RegionPage({ regionId, regionName, regionFlag }) {
     const gamesPerTicket = getGamesPerTicket(selectedSystem);
     const systemSize = getSystemSize(selectedSystem);
     const ticketCount = tickets.length || 1;
-    const spentPerDraw = ticketCount * gamesPerTicket * game.cost;
 
     setSimStats({
       draws: 0,
@@ -155,96 +105,29 @@ export default function RegionPage({ regionId, regionName, regionFlag }) {
       startTime: Date.now()
     });
 
-    let totalDraws = 0;
-    let totalSpent = 0;
-    let totalWon = 0;
-    let div1Won = false;
-    let bestDivision = null;
-    const sessionDivisions = {};
-
-    const runBatch = () => {
-      return new Promise((resolve) => {
-        for (let i = 0; i < simSpeed && !abortRef.current && !div1Won; i++) {
-          const simTickets = [];
-          for (let j = 0; j < ticketCount; j++) {
-            simTickets.push(generateQuickPick(game, systemSize));
-          }
-
-          const mainNumbers = generateNumbers(game.mainPool.count, game.mainPool.range);
-          const bonusNumbers = game.bonusPool ? generateNumbers(game.bonusPool.count, game.bonusPool.range) : null;
-          const supplementary = game.supplementary ? generateNumbers(game.supplementary.count, game.supplementary.range, mainNumbers) : null;
-          const draw = { mainNumbers, bonusNumbers, supplementary };
-
-          totalDraws++;
-          totalSpent += spentPerDraw;
-
-          for (const ticket of simTickets) {
-            const wins = checkTicket(ticket, draw, game);
-            if (wins) {
-              wins.forEach(win => {
-                const prizePerWin = win.division.prizeType === 'monthly'
-                  ? win.division.prize * (win.division.duration || 1)
-                  : (win.division.prize || 0);
-                totalWon += prizePerWin * win.count;
-
-                sessionDivisions[win.division.name] = (sessionDivisions[win.division.name] || 0) + win.count;
-
-                if (win.division.name.includes('1') || win.division.name === 'Jackpot') {
-                  div1Won = true;
-                  bestDivision = win.division;
-                }
-                if (!bestDivision || game.divisions.indexOf(win.division) < game.divisions.indexOf(bestDivision)) {
-                  bestDivision = win.division;
-                }
-              });
-              if (div1Won) break;
-            }
-          }
-        }
-        resolve();
-      });
-    };
-
-    const updateUI = () => {
-      const elapsed = (Date.now() - simStats.startTime) / 1000;
-      const drawsPerSec = totalDraws / elapsed;
-      const yearsSimulated = totalDraws / game.drawsPerYear;
-
-      setSimStats(prev => ({
+    const result = await simulateUntilDivision1({
+      game,
+      systemSize,
+      ticketsPerDraw: ticketCount,
+      batchSize: simSpeed,
+      shouldAbort: () => abortRef.current,
+      onProgress: (snapshot) => setSimStats(prev => ({
         ...prev,
-        draws: totalDraws,
-        spent: totalSpent,
-        won: totalWon,
-        yearsSimulated,
-        drawsPerSec: Math.round(drawsPerSec),
-        bestDivision,
-        div1Won,
-        elapsed
-      }));
-    };
-
-    while (!div1Won && !abortRef.current) {
-      await runBatch();
-      updateUI();
-      await new Promise(r => setTimeout(r, 10));
-    }
-
-    updateUI();
-    setIsSimulating(false);
-
-    const newStats = { ...stats };
-    if (!newStats[selectedGame]) {
-      newStats[selectedGame] = { draws: 0, spent: 0, won: 0, divisions: {} };
-    }
-    newStats[selectedGame].draws += totalDraws;
-    newStats[selectedGame].spent += totalSpent;
-    newStats[selectedGame].won += totalWon;
-
-    Object.entries(sessionDivisions).forEach(([name, count]) => {
-      newStats[selectedGame].divisions[name] = (newStats[selectedGame].divisions[name] || 0) + count;
+        ...snapshot,
+        ticketsPerDraw: ticketCount,
+        gamesPerDraw: ticketCount * gamesPerTicket,
+      })),
     });
 
-    setStats(newStats);
+    setIsSimulating(false);
+
+    // Save final stats via the stats store's accumulation
+    setStats(prev => recordDraw(prev, selectedGame, {
+      draws: result.draws,
+      spent: result.spent,
+      won: result.won,
+      divisions: result.divisions,
+    }));
   };
 
   const stopSimulation = () => {
@@ -293,7 +176,7 @@ export default function RegionPage({ regionId, regionName, regionFlag }) {
         <div className="glass rounded-2xl p-5">
           <h3 className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Entry Type</h3>
           <div className="flex flex-wrap gap-2">
-            {getSystemOptions().map((opt, idx) => (
+            {systemEntries.map((opt, idx) => (
               <button
                 key={idx}
                 onClick={() => setSelectedSystem(opt.value)}
@@ -459,7 +342,7 @@ export default function RegionPage({ regionId, regionName, regionFlag }) {
                         <div key={j} className="flex justify-between items-center mb-1 last:mb-0">
                           <span className="text-sm font-medium text-emerald-300">{win.count}× {win.division.name}</span>
                           <span className="text-sm font-mono text-emerald-400">
-                            {formatCurrency(win.count * (win.division.prizeType === 'monthly' ? win.division.prize * win.division.duration : win.division.prize), game.currency)}
+                            {formatCurrency(prizeValue(win.division, win.count), game.currency)}
                           </span>
                         </div>
                       ))}
