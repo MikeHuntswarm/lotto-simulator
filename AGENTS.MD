@@ -81,3 +81,11 @@ gh run watch [run-id]
 - **Copyright compliance** - Avoid reproducing copyrighted material
 - **Edit philosophy** - Fix root causes, minimal changes, don't alter unrelated code
 - **Retry limit** - Attempt fixes then ask for guidance
+
+## Build workflow
+
+**`bash scripts/verify.sh` is the gate** — build → lint → type-check → test, in order, stopping at
+the first failure. Green there means commit → push → watch CI. Red means fix and re-run from the
+top, and never leave a failed run in the Actions list unresolved.
+
+Method and boundaries: [`docs/WORKFLOW.md`](docs/WORKFLOW.md).
